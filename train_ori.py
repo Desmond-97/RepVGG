@@ -1,8 +1,11 @@
 import argparse
+import os
 import random
 import shutil
 import time
 import warnings
+
+import torch
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -11,20 +14,22 @@ import torch.optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
-from utils_ori import *
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from utils_ori import AverageMeter, accuracy, ProgressMeter, get_default_ImageNet_val_loader, get_default_ImageNet_train_sampler_loader, log_msg
 
-best_acc1 = 0
+from repvgg import get_RepVGG_func_by_name
 
 IMAGENET_TRAINSET_SIZE = 1281167
 
-parser = argparse.ArgumentParser(description='PyTorch Whole Model Quant')
+
+parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='RepVGG-A0')
 parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=8, type=int, metavar='N',
-                    help='number of epochs for each run')
+parser.add_argument('--epochs', default=120, type=int, metavar='N',
+                    help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -34,8 +39,8 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--val-batch-size', default=100, type=int, metavar='V',
                     help='validation batch size')
-parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float,
-                    metavar='LR', help='learning rate for finetuning', dest='lr')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
@@ -51,7 +56,7 @@ parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://127.0.0.1:23333', type=str,
+parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -64,29 +69,21 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
-parser.add_argument('--base-weights', default=None, type=str,
-                    help='weights of the base model.')
+parser.add_argument('--custwd', dest='custwd', action='store_true',
+                    help='Use custom weight decay. It improves the accuracy and makes quantization easier.')
 parser.add_argument('--tag', default='testtest', type=str,
                     help='the tag for identifying the log and model files. Just a string.')
-parser.add_argument('--fpfinetune', dest='fpfinetune', action='store_true',
-                    help='full precision finetune')
-parser.add_argument('--fixobserver', dest='fixobserver', action='store_true',
-                    help='fix observer?')
-parser.add_argument('--fixbn', dest='fixbn', action='store_true',
-                    help='fix bn?')
-parser.add_argument('--quantlayers', default='all', type=str, choices=['all', 'exclud_first_and_linear', 'exclud_first_and_last'],
-                    help='the tag for identifying the log and model files. Just a string.')
 
+best_acc1 = 0
 
-
-def sgd_optimizer(model, lr, momentum, weight_decay):
+def sgd_optimizer(model, lr, momentum, weight_decay, use_custwd):
     params = []
     for key, value in model.named_parameters():
         if not value.requires_grad:
             continue
         apply_weight_decay = weight_decay
         apply_lr = lr
-        if value.ndimension() < 2:  #TODO note this
+        if (use_custwd and ('rbr_dense' in key or 'rbr_1x1' in key)) or 'bias' in key or 'bn' in key:
             apply_weight_decay = 0
             print('set weight decay=0 for {}'.format(key))
         if 'bias' in key:
@@ -133,7 +130,7 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
-    log_file = 'quant_{}_exp.txt'.format(args.tag)
+    log_file = 'train_{}_{}_exp.txt'.format(args.arch, args.tag)
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
@@ -148,65 +145,54 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
-    #   1.  Build and load base model
-    from repvgg import get_RepVGG_func_by_name
     repvgg_build_func = get_RepVGG_func_by_name(args.arch)
-    base_model = repvgg_build_func(deploy=True)
-    from insert_bn import directly_insert_bn_without_init
-    directly_insert_bn_without_init(base_model)
-    if args.base_weights is not None:
-        load_checkpoint(base_model, args.base_weights)
 
-    #   2.
-    if not args.fpfinetune:
-        from quantization.repvgg_quantized import RepVGGWholeQuant
-        qat_model = RepVGGWholeQuant(repvgg_model=base_model, quantlayers=args.quantlayers)
-        qat_model.prepare_quant()
-    else:
-        qat_model = base_model
-        log_msg('===================== not QAT, just full-precision finetune ===========', log_file)
+    model = repvgg_build_func(deploy=False)
 
-    #===================================================
-    #   From now on, the code will be very similar to ordinary training
-    # ===================================================
-
-    is_main = not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0)
+    is_main = not args.multiprocessing_distributed or (
+                args.multiprocessing_distributed and args.rank % ngpus_per_node == 0)
 
     if is_main:
-        for n, p in qat_model.named_parameters():
+        for n, p in model.named_parameters():
             print(n, p.size())
-        for n, p in qat_model.named_buffers():
+        for n, p in model.named_buffers():
             print(n, p.size())
         log_msg('epochs {}, lr {}, weight_decay {}'.format(args.epochs, args.lr, args.weight_decay), log_file)
-        #   You will see it now has quantization-related parameters (zero-points and scales)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
+        # For multiprocessing distributed, DistributedDataParallel constructor
+        # should always set the single device scope, otherwise,
+        # DistributedDataParallel will use all available devices.
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
-            qat_model.cuda(args.gpu)
+            model.cuda(args.gpu)
+            # When using a single GPU per process and per
+            # DistributedDataParallel, we need to divide the batch size
+            # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            qat_model = torch.nn.parallel.DistributedDataParallel(qat_model, device_ids=[args.gpu])
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
-            qat_model.cuda()
-            qat_model = torch.nn.parallel.DistributedDataParallel(qat_model)
+            model.cuda()
+            # DistributedDataParallel will divide and allocate batch_size to all
+            # available GPUs if device_ids are not set
+            model = torch.nn.parallel.DistributedDataParallel(model)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
-        qat_model = qat_model.cuda(args.gpu)
+        model = model.cuda(args.gpu)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
-        qat_model = torch.nn.DataParallel(qat_model).cuda()
+        model = torch.nn.DataParallel(model).cuda()
 
 
+    # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    optimizer = sgd_optimizer(qat_model, args.lr, args.momentum, args.weight_decay)
 
-    warmup_epochs = 1
-    lr_scheduler = WarmupCosineAnnealingLR(optimizer=optimizer, T_cosine_max=args.epochs * IMAGENET_TRAINSET_SIZE // args.batch_size // ngpus_per_node,
-                            eta_min=0, warmup=warmup_epochs * IMAGENET_TRAINSET_SIZE // args.batch_size // ngpus_per_node)
+    optimizer = sgd_optimizer(model, args.lr, args.momentum, args.weight_decay, args.custwd)
 
+    lr_scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=args.epochs * IMAGENET_TRAINSET_SIZE // args.batch_size // ngpus_per_node)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -223,7 +209,7 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
-            qat_model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['scheduler'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -237,44 +223,35 @@ def main_worker(gpu, ngpus_per_node, args):
     val_loader = get_default_ImageNet_val_loader(args)
 
     if args.evaluate:
-        validate(val_loader, qat_model, criterion, args)
+        validate(val_loader, model, criterion, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
+        # adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, qat_model, criterion, optimizer, epoch, args, lr_scheduler, is_main=is_main)
+        train(train_loader, model, criterion, optimizer, epoch, args, lr_scheduler, is_main=is_main)
 
-        if args.fixobserver and epoch > (3 * args.epochs // 8):
-            # Freeze quantizer parameters
-            qat_model.apply(torch.quantization.disable_observer)  #TODO testing. May not be useful
-            log_msg('fix observer after epoch {}'.format(epoch), log_file)
-
-        if args.fixbn and epoch > (2 * args.epochs // 8):    #TODO testing. May not be useful
-        #     Freeze batch norm mean and variance estimates
-            qat_model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
-            log_msg('fix bn after epoch {}'.format(epoch), log_file)
-
-        # evaluate on validation set
         if is_main:
-            acc1 = validate(val_loader, qat_model, criterion, args)
-            msg = '{}, base{}, quant, epoch {}, QAT acc {}'.format(args.arch, args.base_weights, epoch, acc1)
+            # evaluate on validation set
+            acc1 = validate(val_loader, model, criterion, args)
+            msg = '{}, epoch {}, acc {}'.format(args.arch, epoch, acc1)
             log_msg(msg, log_file)
 
+            # remember best acc@1 and save checkpoint
             is_best = acc1 > best_acc1
             best_acc1 = max(acc1, best_acc1)
 
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
-                'state_dict': qat_model.state_dict(),
+                'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
                 'scheduler': lr_scheduler.state_dict(),
-            }, is_best,
-                filename = '{}_{}.pth.tar'.format(args.arch, args.tag),
+            }, is_best, filename = '{}_{}.pth.tar'.format(args.arch, args.tag),
                 best_filename='{}_{}_best.pth.tar'.format(args.arch, args.tag))
 
 
@@ -297,15 +274,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args, lr_scheduler, 
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        if torch.cuda.is_available():
-            target = target.cuda(args.gpu, non_blocking=True)
+        images = images.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-
         output = model(images)
         loss = criterion(output, target)
+
+        if args.custwd:
+            for module in model.modules():
+                if hasattr(module, 'get_custom_L2'):
+                    loss += args.weight_decay * 0.5 * module.get_custom_L2()
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -322,12 +301,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, lr_scheduler, 
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if lr_scheduler is not None:
-            lr_scheduler.step()
+        lr_scheduler.step()
 
         if is_main and i % args.print_freq == 0:
             progress.display(i)
-        if is_main and i % 1000 == 0 and lr_scheduler is not None:
+        if is_main and i % 1000 == 0:
             print('cur lr: ', lr_scheduler.get_lr()[0])
 
 
@@ -349,8 +327,10 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            if torch.cuda.is_available():
+                target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
             output = model(images)
@@ -369,7 +349,6 @@ def validate(val_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
@@ -380,7 +359,6 @@ def save_checkpoint(state, is_best, filename, best_filename):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, best_filename)
-
 
 
 

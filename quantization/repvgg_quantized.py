@@ -47,7 +47,8 @@ class RepVGGWholeQuant(nn.Module):
             if type(m) == nn.Sequential and hasattr(m, 'conv'):
                 # Note that we moved ReLU from "block.nonlinearity" into "rbr_reparam" (nn.Sequential).
                 # This makes it more convenient to fuse operators using off-the-shelf APIs.
-                torch.quantization.fuse_modules(m, ['conv', 'bn', 'relu'], inplace=True)
+                # torch.quantization.fuse_modules(m, ['conv', 'bn', 'relu'], inplace=True)
+                torch.quantization.fuse_modules(m, ['conv'], inplace=True)
 
     def _get_qconfig(self):
         return torch.quantization.get_default_qat_qconfig('fbgemm')

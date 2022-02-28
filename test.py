@@ -8,9 +8,9 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-from utils import accuracy, ProgressMeter, AverageMeter
+from utils_ori import accuracy, ProgressMeter, AverageMeter
 from repvgg import get_RepVGG_func_by_name
-from utils import load_checkpoint, get_default_ImageNet_val_loader
+from utils_ori import load_checkpoint, get_default_ImageNet_val_loader
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Test')
 parser.add_argument('data', metavar='DIR', help='path to dataset')
